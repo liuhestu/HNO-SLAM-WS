@@ -1,0 +1,22 @@
+# ROS/catkin build outputs
+build/
+devel/
+logs/
+
+# CMake and generated artifacts
+**/CMakeFiles/
+**/CMakeCache.txt
+**/cmake_install.cmake
+**/Makefile
+**/CTestTestfile.cmake
+**/CTestConfiguration.ini
+**/CTestCustom.cmake
+
+# Python cache
+__pycache__/
+*.pyc
+
+# Editor/OS
+.vscode/
+.DS_Store
+Thumbs.db

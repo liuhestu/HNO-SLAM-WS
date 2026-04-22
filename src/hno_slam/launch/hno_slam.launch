@@ -1,0 +1,26 @@
+<launch>
+  <arg name="config" default="euroc_mav" />
+  <arg name="config_path" default="$(find hno_slam)/euroc_mav/config/estimator_config.yaml" />
+
+  <arg name="topic_imu" default="/imu0" />
+  <arg name="topic_cam0" default="/cam0/image_raw" />
+  <arg name="topic_cam1" default="/cam1/image_raw" />
+
+  <arg name="dobag" default="true" />
+  <arg name="bag" default="/home/he/datasets/ROSbag/V1_01_easy.bag" />
+  <arg name="bag_rate" default="1.0" />
+
+  <node pkg="hno_slam" type="hno_slam_node" name="hno_slam" output="screen" required="true">
+    <param name="config_path" type="string" value="$(arg config_path)" />
+    <param name="topic_imu" type="string" value="$(arg topic_imu)" />
+    <param name="topic_cam0" type="string" value="$(arg topic_cam0)" />
+    <param name="topic_cam1" type="string" value="$(arg topic_cam1)" />
+  </node>
+
+  <group if="$(arg dobag)">
+    <node pkg="rosbag" type="play" name="rosbag_play" args="-d 1 -r $(arg bag_rate) $(arg bag)" />
+  </group>
+
+    <node pkg="rviz" type="rviz" name="rviz" args="-d $(find hno_slam)/launch/hno.rviz" />
+
+</launch>
