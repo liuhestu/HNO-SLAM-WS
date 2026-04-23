@@ -15,6 +15,7 @@ class Observer {
            double noise_acc,
            double noise_gyro,
            double sigma_pix,
+           double sigma_p_proc,
            const std::vector<Eigen::Matrix4d>& T_C_B);
 
   void propagate(State& state,
@@ -34,6 +35,7 @@ class Observer {
   double k_R_;
   Eigen::MatrixXd V_noise_;
   double sigma_pix_;
+  double sigma_p_proc_;
   std::vector<Eigen::Matrix4d> T_C_B_;
 };
 

@@ -1,0 +1,7 @@
+-std=c++17
+-Iinclude/hno_slam
+-Ithirdparty
+-isystem
+/usr/include/eigen3
+-isystem
+/usr/include/opencv4

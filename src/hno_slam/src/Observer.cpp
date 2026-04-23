@@ -14,10 +14,17 @@ Observer::Observer(double k_R,
                    double noise_acc,
                    double noise_gyro,
                    double sigma_pix,
+                   double sigma_p_proc,
                    const std::vector<Eigen::Matrix4d>& T_C_B)
-    : gravity_w_(0.0, 0.0, -9.81), k_R_(k_R), sigma_pix_(sigma_pix), T_C_B_(T_C_B) {
+    : gravity_w_(0.0, 0.0, -9.81),
+      k_R_(k_R),
+      sigma_pix_(sigma_pix),
+      sigma_p_proc_(sigma_p_proc),
+      T_C_B_(T_C_B) {
   // V_noise_ 是传播方程中的过程噪声协方差（仅作用在主状态 v/g 对应子块）。
   // 可调参数：noise_acc, noise_gyro（越大代表对 IMU 越不信任）。
+  // 路标块的过程噪声 sigma_p_proc_ 在 propagate 中按活跃槽位注入，
+  // 以满足论文 Theorem 1 对 V(t) ≻ 0 的一致正定性要求。
   V_noise_ = Eigen::MatrixXd::Zero(6, 6);
   V_noise_.block<3, 3>(0, 0) = (noise_acc * noise_acc) * Eigen::Matrix3d::Identity();
   V_noise_.block<3, 3>(3, 3) = (noise_gyro * noise_gyro) * Eigen::Matrix3d::Identity();
@@ -163,30 +170,51 @@ void Observer::propagate(State& state,
   const int total_dim = 6 + 3 * State::N_MAX;
   Eigen::MatrixXd A = Eigen::MatrixXd::Zero(total_dim, total_dim);
   const Eigen::Matrix3d omega_skew = skew(omega_m);
-  // A 为误差线性化系统矩阵，对应论文误差系统 Jacobian。
-  A.block<3, 3>(0, 0) = -omega_skew;
-  A.block<3, 3>(0, 3) = Eigen::Matrix3d::Identity();
-  A.block<3, 3>(3, 3) = -omega_skew;
+  // A 为误差线性化系统矩阵，对应论文 Eq. 35 / 37：
+  //   A(t) = [[ D(t),      0_{6x3n}         ],
+  //           [ B_n ⊗ I_3, I_n ⊗ (-[ω_B]×) ]]
+  // 其中 D(t) = [[-[ω_B]×, I_3], [0, -[ω_B]×]]，B_n = [1_n, 0_{n×1}]。
+  // 因此每个活跃路标 p_i 的误差动力学既含 -[ω_B]× 对角项，也有 I_3 耦合至速度 v。
+  A.block<3, 3>(0, 0) = -omega_skew;           // v <- v
+  A.block<3, 3>(0, 3) = Eigen::Matrix3d::Identity();  // v <- g
+  A.block<3, 3>(3, 3) = -omega_skew;           // g <- g
 
   for (int i = 0; i < State::N_MAX; ++i) {
     if (!state.is_active[i]) {
       continue;
     }
     const int idx = 6 + i * 3;
-    A.block<3, 3>(idx, idx) = -omega_skew;
+    A.block<3, 3>(idx, idx) = -omega_skew;              // p_i <- p_i
+    A.block<3, 3>(idx, 0) = Eigen::Matrix3d::Identity();  // p_i <- v (B_n ⊗ I_3)
   }
 
   // 协方差传播：P_dot = A P + P A^T + V。
-  // 对应论文：连续 Riccati 型传播。
+  // 对应论文 Theorem 1：V(t) 需一致正定，因此需要给活跃路标块注入
+  // 过程噪声 sigma_p_proc_^2 · I_3，否则 3n 路标子块恒为 0 将违反正定性。
   Eigen::MatrixXd V = Eigen::MatrixXd::Zero(total_dim, total_dim);
   V.block(0, 0, 6, 6) = V_noise_;
+  const double v_p = sigma_p_proc_ * sigma_p_proc_;
+  for (int i = 0; i < State::N_MAX; ++i) {
+    if (!state.is_active[i]) {
+      continue;
+    }
+    const int idx = 6 + i * 3;
+    V.block<3, 3>(idx, idx) = v_p * Eigen::Matrix3d::Identity();
+  }
   state.P = state.P + (A * state.P + state.P * A.transpose() + V) * dt;
+
+  // 数值对称化：抑制欧拉积分误差累积导致的非对称，保证 LDLT 分解稳定。
+  state.P = 0.5 * (state.P + state.P.transpose());
 }
 
-// 视觉更新（信息形式）。
-// 对应论文：跳变/校正方程；并遵循 K_p = 0（不更新绝对位置 p_hat）。
+// 视觉更新（信息形式，活跃子块解算）。
+// 对应论文 Algorithm 1 的离散跳变步骤 12-20；并遵循 text.md 约束：
+//   * 不更新 R_hat（旋转/平移解耦，见 Eq. 46）；
+//   * 不更新 p_hat（K_p = 0，全局位置不可观）；
+//   * 仅更新 v_hat、g_hat 以及活跃路标 p_i。
+// 数值实现上，把矩阵压缩到 (6 + 3·n_active) 的活跃子块后再做信息形式分解，
+// 避免对 156×156 的稀疏非活跃对角（1e-8 I）进行病态求逆。
 void Observer::update(State& state, const std::vector<FeatureObs>& observations) {
-  // 无观测直接返回。
   if (observations.empty()) {
     return;
   }
@@ -245,8 +273,7 @@ void Observer::update(State& state, const std::vector<FeatureObs>& observations)
     valid_obs.push_back({obs, slot});
   }
 
-  const int M = static_cast<int>(valid_obs.size());
-  if (M == 0) {
+  if (valid_obs.empty()) {
     return;
   }
 
@@ -260,21 +287,61 @@ void Observer::update(State& state, const std::vector<FeatureObs>& observations)
   const Eigen::Vector3d p_bc_l = -R_cb_l.transpose() * p_cb_l;
   const Eigen::Vector3d p_bc_r = -R_cb_r.transpose() * p_cb_r;
 
-  // 2) 构建线性化系统 r = C * delta + noise。
-  // 维度：每个观测贡献 3 维投影残差。
-  const int total_dim = 6 + 3 * State::N_MAX;
-  Eigen::MatrixXd C = Eigen::MatrixXd::Zero(3 * M, total_dim);
+  // 2) 活跃槽位索引化：把全局 slot 映射到紧凑的子块 local index。
+  //    子块列布局：[ v (3) | g (3) | p_{s_0} (3) | p_{s_1} (3) | ... ]
+  std::vector<int> used_slots;          // 保留本次观测涉及到的 slot（去重后按出现顺序）
+  used_slots.reserve(valid_obs.size());
+  std::vector<int> slot_to_local(State::N_MAX, -1);
+
+  for (const auto& it : valid_obs) {
+    const int slot = it.slot;
+    if (slot < 0 || slot >= State::N_MAX || !state.is_active[slot]) {
+      continue;
+    }
+    if (slot_to_local[slot] < 0) {
+      slot_to_local[slot] = static_cast<int>(used_slots.size());
+      used_slots.push_back(slot);
+    }
+  }
+
+  const int n_active = static_cast<int>(used_slots.size());
+  if (n_active == 0) {
+    return;
+  }
+
+  const int sub_dim = 6 + 3 * n_active;
+
+  // 3) 从全量 state.P 提取活跃子块 P_sub。
+  //    列 [0..2] = v, [3..5] = g, [6+3k..8+3k] = 第 k 个活跃槽位。
+  Eigen::MatrixXd P_sub = Eigen::MatrixXd::Zero(sub_dim, sub_dim);
+  P_sub.block<6, 6>(0, 0) = state.P.block<6, 6>(0, 0);
+  for (int k = 0; k < n_active; ++k) {
+    const int g_k = 6 + used_slots[k] * 3;  // 全局行/列
+    const int l_k = 6 + k * 3;              // 局部行/列
+    P_sub.block<6, 3>(0, l_k) = state.P.block<6, 3>(0, g_k);
+    P_sub.block<3, 6>(l_k, 0) = state.P.block<3, 6>(g_k, 0);
+    for (int j = 0; j < n_active; ++j) {
+      const int g_j = 6 + used_slots[j] * 3;
+      const int l_j = 6 + j * 3;
+      P_sub.block<3, 3>(l_k, l_j) = state.P.block<3, 3>(g_k, g_j);
+    }
+  }
+
+  // 4) 构建观测方程 r = C_sub · δ + noise。每条观测贡献 3 维投影残差
+  //    （左右目叠加），C 行仅在对应活跃路标列块放 Π_total（论文 Eq. 33）。
+  const int M = static_cast<int>(valid_obs.size());
+  Eigen::MatrixXd C_sub = Eigen::MatrixXd::Zero(3 * M, sub_dim);
   Eigen::VectorXd r = Eigen::VectorXd::Zero(3 * M);
   Eigen::MatrixXd Q = Eigen::MatrixXd::Zero(3 * M, 3 * M);
-
-  // 注：used_slots 当前仅用于调试/可扩展分析，不参与后续数值解算。
-  std::vector<int> used_slots;
-  used_slots.reserve(M);
 
   int row_obs = 0;
   for (const auto& it : valid_obs) {
     const int slot = it.slot;
     if (slot < 0 || slot >= State::N_MAX || !state.is_active[slot]) {
+      continue;
+    }
+    const int local = slot_to_local[slot];
+    if (local < 0) {
       continue;
     }
 
@@ -284,11 +351,11 @@ void Observer::update(State& state, const std::vector<FeatureObs>& observations)
     const Eigen::Vector3d y_l(it.obs.uv_l_norm(0), it.obs.uv_l_norm(1), 1.0);
     const Eigen::Vector3d y_r(it.obs.uv_r_norm(0), it.obs.uv_r_norm(1), 1.0);
 
-    // 双目投影矩阵 Pi_l / Pi_r（对应论文测量模型中的投影算子）。
+    // 机体系下的投影算子：Π_q = R_{bc_q} π(y_q) R_{bc_q}^T（论文 Eq. 21/27）。
     const Eigen::Matrix3d pi_l = R_bc_l * project_pi(y_l) * R_bc_l.transpose();
     const Eigen::Matrix3d pi_r = R_bc_r * project_pi(y_r) * R_bc_r.transpose();
 
-    // 观测残差：左右目残差叠加。
+    // 双目残差：σ_i^p = Σ_q Π_q · (R̂^T(p̂_i - p̂) - p_bc_q)。
     const Eigen::Vector3d residual_l = pi_l * (p_i_B - p_bc_l);
     const Eigen::Vector3d residual_r = pi_r * (p_i_B - p_bc_r);
     const Eigen::Vector3d r_i = residual_l + residual_r;
@@ -297,14 +364,12 @@ void Observer::update(State& state, const std::vector<FeatureObs>& observations)
     const int row = row_obs * 3;
     r.segment<3>(row) = r_i;
     // 测量噪声：随深度平方缩放（远点噪声放大），并加 1e-8 防奇异。
-    // 关键可调参数：sigma_pix_（前端归一化测量噪声标准差）。
+    // 可调参数：sigma_pix_（前端归一化测量噪声标准差）。
     Q.block<3, 3>(row, row) = (p_i_B.squaredNorm() * sigma_pix_ * sigma_pix_) * Pi_total +
                               1e-8 * Eigen::Matrix3d::Identity();
 
-    // 当前实现仅估计地图点子状态（6+slot*3），主状态增量在此 C 中未显式耦合。
-    C.block<3, 3>(row, 6 + slot * 3) = Pi_total;
-
-    used_slots.push_back(slot);
+    // C 在 [v, g] 列为 0，仅在该路标对应的 local 列块放 Π_total。
+    C_sub.block<3, 3>(row, 6 + local * 3) = Pi_total;
     row_obs += 1;
   }
 
@@ -313,60 +378,70 @@ void Observer::update(State& state, const std::vector<FeatureObs>& observations)
   }
 
   if (row_obs != M) {
-    // 若有观测被跳过，压缩到真实有效尺寸。
-    C.conservativeResize(3 * row_obs, Eigen::NoChange);
+    C_sub.conservativeResize(3 * row_obs, Eigen::NoChange);
     r.conservativeResize(3 * row_obs);
     Q.conservativeResize(3 * row_obs, 3 * row_obs);
   }
 
-  // 3) 信息形式解算：
-  // M = P^{-1} + C^T Q^{-1} C,   delta = M^{-1} C^T Q^{-1} r
-  // 对应论文：离散跳变更新的信息矩阵形式。
-  const Eigen::MatrixXd I_state = Eigen::MatrixXd::Identity(total_dim, total_dim);
+  // 5) 信息形式解算：
+  //    M = P_sub^{-1} + C_sub^T Q^{-1} C_sub,   δ = M^{-1} C_sub^T Q^{-1} r。
+  const Eigen::MatrixXd I_sub = Eigen::MatrixXd::Identity(sub_dim, sub_dim);
   const Eigen::MatrixXd I_meas = Eigen::MatrixXd::Identity(Q.rows(), Q.cols());
 
-  const Eigen::LDLT<Eigen::MatrixXd> ldltP(state.P);
-  const Eigen::MatrixXd P_inv = ldltP.solve(I_state);
+  const Eigen::LDLT<Eigen::MatrixXd> ldltP(P_sub);
+  const Eigen::MatrixXd P_inv = ldltP.solve(I_sub);
 
   const Eigen::LDLT<Eigen::MatrixXd> ldltQ(Q);
   const Eigen::MatrixXd Q_inv = ldltQ.solve(I_meas);
 
-  Eigen::MatrixXd M_info = P_inv + C.transpose() * Q_inv * C;
-  // 先强制对称，抑制数值误差导致的非对称。
+  Eigen::MatrixXd M_info = P_inv + C_sub.transpose() * Q_inv * C_sub;
+  // 强制对称 + Tikhonov 正则化，保证 LDLT 分解稳定。
   M_info = 0.5 * (M_info + M_info.transpose());
-  // Tikhonov 正则化（你要求新增）：确保 LDLT 更稳定，防止近奇异。
-  // 可调：1e-8，若出现数值病态可增大到 1e-7/1e-6。
   M_info.diagonal().array() += 1e-8;
 
-  Eigen::VectorXd rhs = C.transpose() * Q_inv * r;
+  const Eigen::VectorXd rhs = C_sub.transpose() * Q_inv * r;
   const Eigen::LDLT<Eigen::MatrixXd> ldltM(M_info);
   const Eigen::VectorXd delta = ldltM.solve(rhs);
 
   const Eigen::Vector3d delta_v = delta.segment<3>(0);
   const Eigen::Vector3d delta_g = delta.segment<3>(3);
 
-  // 4) 应用跳变增量。
-  // 对应论文 K_p = 0 约束：只更新 v_hat / g_hat / p_i，不更新 p_hat。
+  // 6) 应用跳变增量（Algorithm 1 line 15-19，K_p = 0）。
+  //    * v̂、ĝ 的 x-分量定义为 R̂^T(v - v̂)、R̂^T(g - ĝ)（真 - 估），
+  //      故估计量用 `+= R̂ δ` 向真值靠拢。
+  //    * p_i 的 x-分量为 R̂^T((p - p̂) - (p_i - p̂_i))，在 K_p = 0 下约等于
+  //      R̂^T(p̂_i - p_i)（估 - 真），因此估计量需要 `-= R̂ δ_{p_i}`
+  //      才能朝真值收敛。该负号与论文 Eq. 45 中 Γ 的显式负号对应。
   state.v_hat += state.R_hat * delta_v;
   state.g_hat += state.R_hat * delta_g;
-
-  for (int i = 0; i < State::N_MAX; ++i) {
-    if (!state.is_active[i]) {
-      continue;
-    }
-    const Eigen::Vector3d delta_pi = delta.segment<3>(6 + i * 3);
-    state.p_L[i] += state.R_hat * delta_pi;
+  for (int k = 0; k < n_active; ++k) {
+    const int slot = used_slots[k];
+    const Eigen::Vector3d delta_pi = delta.segment<3>(6 + k * 3);
+    state.p_L[slot] -= state.R_hat * delta_pi;
   }
 
-  // 后验协方差：P = M^{-1}。
-  state.P = ldltM.solve(I_state);
-  // 数值对称化，防止后续分解误差累积。
-  state.P = 0.5 * (state.P + state.P.transpose());
+  // 7) 后验协方差：P_sub^+ = M^{-1}，对称化后散射回 state.P 的活跃行/列。
+  //    非活跃块保持不变（保留前一次传播得到的协方差，避免被污染）。
+  Eigen::MatrixXd P_sub_post = ldltM.solve(I_sub);
+  P_sub_post = 0.5 * (P_sub_post + P_sub_post.transpose());
+
+  state.P.block<6, 6>(0, 0) = P_sub_post.block<6, 6>(0, 0);
+  for (int k = 0; k < n_active; ++k) {
+    const int g_k = 6 + used_slots[k] * 3;
+    const int l_k = 6 + k * 3;
+    state.P.block<6, 3>(0, g_k) = P_sub_post.block<6, 3>(0, l_k);
+    state.P.block<3, 6>(g_k, 0) = P_sub_post.block<3, 6>(l_k, 0);
+    for (int j = 0; j < n_active; ++j) {
+      const int g_j = 6 + used_slots[j] * 3;
+      const int l_j = 6 + j * 3;
+      state.P.block<3, 3>(g_k, g_j) = P_sub_post.block<3, 3>(l_k, l_j);
+    }
+  }
+
+  // 对角下界截断：避免数值噪声导致非正对角。
   for (int i = 0; i < state.P.rows(); ++i) {
-    // 下界截断（可调）：避免对角出现非正或过小导致病态。
     state.P(i, i) = std::max(state.P(i, i), 1e-9);
   }
-
 }
 
 }  // namespace hno_slam

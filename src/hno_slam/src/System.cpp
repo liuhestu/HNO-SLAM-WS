@@ -78,11 +78,14 @@ System::System(const std::string& config_path)
   double noise_acc = 2.0e-3;
   double noise_gyro = 1.6968e-4;
   double sigma_pix = 1.0;
+  // 路标过程噪声密度：保证论文 Theorem 1 所需 V(t) ≻ 0（活跃路标块）。
+  double landmark_noise_density = 1.0e-4;
 
   cv::FileStorage fs_est(config_path, cv::FileStorage::READ);
   if (fs_est.isOpened()) {
     k_R = read_double_or(fs_est.root(), "k_R", k_R);
     sigma_pix = read_double_or(fs_est.root(), "up_slam_sigma_px", sigma_pix);
+    landmark_noise_density = read_double_or(fs_est.root(), "landmark_noise_density", landmark_noise_density);
 
     const std::string folder = config_path.substr(0, config_path.find_last_of('/')) + "/";
     const std::string imucam_path = folder + read_string_or(fs_est.root(), "relative_config_imucam", "kalibr_imucam_chain.yaml");
@@ -156,7 +159,7 @@ System::System(const std::string& config_path)
   state_ = std::make_shared<State>();
   initializer_ = std::make_shared<Initializer>();
   frontend_ = std::make_shared<Frontend>(cameras, T_C_B);
-  observer_ = std::make_shared<Observer>(k_R, noise_acc, noise_gyro, sigma_pix, T_C_B);
+  observer_ = std::make_shared<Observer>(k_R, noise_acc, noise_gyro, sigma_pix, landmark_noise_density, T_C_B);
 }
 
 void System::feed_imu(const ov_core::ImuData& msg) {

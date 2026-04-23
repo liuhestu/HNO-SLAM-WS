@@ -1,6 +1,13 @@
 cmake_minimum_required(VERSION 3.0.2)
 project(hno_slam)
 
+# Symlink launch/, install rules, etc. into devel/share/<pkg>/ so roslaunch finds them
+# without running `make install` (see catkin CATKIN_SYMLINK_INSTALL).
+set(CATKIN_SYMLINK_INSTALL ON)
+
+# Generate compile_commands.json for IDE outline / clangd / IntelliSense
+set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
+
 # Enable C++17 for structured bindings
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -16,17 +23,16 @@ find_package(catkin REQUIRED COMPONENTS
   image_transport
   message_filters
   tf
-  ov_core
 )
 
 find_package(Eigen3 REQUIRED)
 find_package(OpenCV REQUIRED)
-find_package(Boost REQUIRED)
+find_package(Boost REQUIRED COMPONENTS system thread date_time)
 
 catkin_package(
   INCLUDE_DIRS include
   LIBRARIES hno_slam_core
-  CATKIN_DEPENDS roscpp ov_core
+  CATKIN_DEPENDS roscpp
 )
 
 include_directories(
@@ -44,6 +50,11 @@ add_library(hno_slam_core
   src/Frontend.cpp
   src/Observer.cpp
   src/System.cpp
+  thirdparty/utils/print.cpp
+  thirdparty/track/TrackBase.cpp
+  thirdparty/track/TrackKLT.cpp
+  thirdparty/feat/Feature.cpp
+  thirdparty/feat/FeatureDatabase.cpp
 )
 target_link_libraries(hno_slam_core ${catkin_LIBRARIES} ${OpenCV_LIBRARIES} ${Boost_LIBRARIES})
 

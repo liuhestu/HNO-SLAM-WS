@@ -17,7 +17,6 @@
     <depend>image_transport</depend>
     <depend>message_filters</depend>
     <depend>tf</depend>
-    <depend>ov_core</depend>
     <depend>eigen</depend>
     <depend>libopencv-dev</depend>
 </package>
